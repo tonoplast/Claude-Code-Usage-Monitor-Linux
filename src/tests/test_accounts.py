@@ -1,6 +1,8 @@
 """Tests for the --accounts per-account summary (accounts.py)."""
 
 import argparse
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import patch
@@ -210,6 +212,71 @@ def test_two_accounts_stay_independent_not_merged() -> None:
     )
 
 
+def _jsonl_entry(model: str, ts: str, output_tokens: int = 50) -> Dict[str, Any]:
+    return {
+        "timestamp": ts,
+        "message": {
+            "usage": {"input_tokens": 100, "output_tokens": output_tokens},
+            "model": model,
+            "id": f"{model}-{ts}-id",
+        },
+        "model": model,
+        "requestId": f"{model}-{ts}-req",
+    }
+
+
+def _write_account_fixture(
+    projects_dir: Path, num_entries: int, output_tokens: int
+) -> None:
+    now = datetime.now(timezone.utc)
+    rows = [
+        _jsonl_entry(
+            "claude-opus-4-8",
+            (now - timedelta(minutes=n + 1)).isoformat(),
+            output_tokens=output_tokens,
+        )
+        for n in range(num_entries)
+    ]
+    session_dir = projects_dir / "session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "session.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+
+
+def test_build_account_snapshot_real_fixture_files_not_mocked(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real config_dir -> projects -> analyze_usage path with no
+    mocking of analyze_usage, using real JSONL fixture files on disk."""
+    work_dir = tmp_path / "work"
+    personal_dir = tmp_path / "personal"
+    _write_account_fixture(work_dir / "projects", num_entries=2, output_tokens=50)
+    _write_account_fixture(personal_dir / "projects", num_entries=5, output_tokens=200)
+
+    args = _args(plan="pro")
+    with (
+        patch.object(accounts_mod, "read_official_limits", return_value=None),
+        patch.object(accounts_mod, "read_api_limits", return_value=None),
+    ):
+        work_row = build_account_snapshot("work", str(work_dir), args, now_epoch=1000)
+        personal_row = build_account_snapshot(
+            "personal", str(personal_dir), args, now_epoch=1000
+        )
+
+    for row, name, config_dir in (
+        (work_row, "work", str(work_dir)),
+        (personal_row, "personal", str(personal_dir)),
+    ):
+        assert set(row.keys()) == {"name", "config_dir", "snapshot"}
+        assert row["name"] == name
+        assert row["config_dir"] == config_dir
+        assert row["snapshot"]["local"]["is_active"] is True
+
+    work_tokens = work_row["snapshot"]["local"]["tokens"]["total_tokens"]
+    personal_tokens = personal_row["snapshot"]["local"]["tokens"]["total_tokens"]
+    assert work_tokens != personal_tokens
+    assert personal_tokens > work_tokens
+
+
 def _row(
     name: str, five_pct: Any, seven_pct: Any = None, code: int = 0
 ) -> Dict[str, Any]:
@@ -241,6 +308,15 @@ def test_build_accounts_table_has_one_row_per_account() -> None:
     rows = [_row("work", 90.0, code=11), _row("personal", 5.0, code=0)]
     table = build_accounts_table(rows)
     assert table.row_count == 2
+
+
+def test_build_accounts_table_clamps_left_pct_at_zero_when_over_limit() -> None:
+    rows = [_row("work", 120.0)]
+    table = build_accounts_table(rows)
+    assert table.row_count == 1
+    five_h_left_column = table.columns[2]
+    assert five_h_left_column.header == "5h Left"
+    assert five_h_left_column._cells == ["0.0%"]
 
 
 def test_build_accounts_payload_keeps_accounts_separate() -> None:

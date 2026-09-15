@@ -199,13 +199,22 @@ def read_oauth_token(
 ) -> Optional[str]:
     """Return an OAuth access token from env or Claude's credentials file.
 
-    Precedence: ``CLAUDE_CODE_OAUTH_TOKEN`` env > explicit ``credentials_path``
-    > ``(config_dir or CLAUDE_CONFIG_DIR)/.credentials.json`` > the global
-    ``~/.claude/.credentials.json``.
+    Precedence depends on whether ``config_dir`` is explicitly passed:
+
+    - ``config_dir is None`` (the ambient, single-account call sites, e.g.
+      ``read_api_limits`` with no ``config_dir``): ``CLAUDE_CODE_OAUTH_TOKEN``
+      env > explicit ``credentials_path`` > ``CLAUDE_CONFIG_DIR``/
+      ``.credentials.json`` > the global ``~/.claude/.credentials.json``.
+    - ``config_dir is not None`` (a per-account call, e.g. under
+      ``--accounts``): the env var is intentionally skipped so one shell-wide
+      ``CLAUDE_CODE_OAUTH_TOKEN`` can't silently collapse every account onto
+      the same identity. Precedence is explicit ``credentials_path`` >
+      ``config_dir``/``.credentials.json`` > the global default.
     """
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if token:
-        return token
+    if config_dir is None:
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if token:
+            return token
 
     if credentials_path is not None:
         path = credentials_path

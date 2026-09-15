@@ -152,7 +152,7 @@ def _pct_str(value: Optional[float]) -> str:
 
 
 def _left_str(value: Optional[float]) -> str:
-    return f"{100 - value:.1f}%" if value is not None else "--"
+    return f"{max(0.0, 100 - value):.1f}%" if value is not None else "--"
 
 
 def _resets_str(iso: Optional[str]) -> str:

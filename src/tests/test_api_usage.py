@@ -204,11 +204,25 @@ def test_default_api_cache_path_uses_config_dir_env(
     assert p.name == "home_tono_.claude-work.json"
 
 
-def test_read_oauth_token_prefers_env_token(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_read_oauth_token_prefers_env_token_when_config_dir_not_passed(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "env-token")
-    assert read_oauth_token(config_dir=str(tmp_path)) == "env-token"
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert read_oauth_token() == "env-token"
+
+
+def test_read_oauth_token_config_dir_wins_over_env_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A per-account call (explicit config_dir) must not let one shell-wide
+    CLAUDE_CODE_OAUTH_TOKEN silently collapse every account onto the same
+    identity (#final-review finding 3)."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "env-token")
+    (tmp_path / ".credentials.json").write_text(
+        json.dumps({"accessToken": "work-token"})
+    )
+    assert read_oauth_token(config_dir=str(tmp_path)) == "work-token"
 
 
 def test_read_oauth_token_reads_config_dir_credentials(
