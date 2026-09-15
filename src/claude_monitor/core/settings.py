@@ -247,6 +247,20 @@ class Settings(BaseSettings):
         description="Freshness TTL for the experimental API cache in seconds",
     )
 
+    accounts: bool = Field(
+        default=False,
+        description="Show a per-account usage summary (5h/weekly % left) "
+        "instead of the normal single-account view. Accounts come from "
+        "--accounts-list or the CLAUDE_MONITOR_ACCOUNTS env var (name=dir "
+        "pairs)",
+    )
+
+    accounts_list: List[str] = Field(
+        default_factory=list,
+        description="Explicit name=dir account pairs for --accounts (repeat "
+        "or comma-separate); overrides CLAUDE_MONITOR_ACCOUNTS when given",
+    )
+
     data_paths: List[str] = Field(
         default_factory=list,
         description="Claude data directories to scan; repeat or comma-separate values",
@@ -578,6 +592,8 @@ class Settings(BaseSettings):
         args.api_cache_file = self.api_cache_file
         args.api_ttl_seconds = self.api_ttl_seconds
         args.data_paths = list(self.data_paths)
+        args.accounts = self.accounts
+        args.accounts_list = list(self.accounts_list)
         args.warehouse = self.warehouse
         args.warehouse_file = self.warehouse_file
         args.warehouse_retention_days = self.warehouse_retention_days

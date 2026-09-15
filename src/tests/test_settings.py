@@ -940,6 +940,32 @@ class TestSettings:
         with pytest.raises(ValidationError):
             Settings(data_paths=["/a", "  "], _cli_parse_args=[])
 
+    def test_accounts_default_cli_and_namespace(self) -> None:
+        """--accounts/--accounts-list are plain CLI fields, not a manual parser."""
+        default = Settings(_cli_parse_args=[])
+        assert default.accounts is False
+        assert default.accounts_list == []
+        assert default.to_namespace().accounts is False
+        assert default.to_namespace().accounts_list == []
+
+        parsed = Settings(
+            _cli_parse_args=[
+                "--accounts",
+                "--accounts-list",
+                "work=/a",
+                "--accounts-list",
+                "personal=/b,/c=/d",
+            ]
+        )
+        assert parsed.accounts is True
+        assert parsed.accounts_list == ["work=/a", "personal=/b", "/c=/d"]
+        assert parsed.to_namespace().accounts is True
+        assert parsed.to_namespace().accounts_list == [
+            "work=/a",
+            "personal=/b",
+            "/c=/d",
+        ]
+
 
 class TestSettingsIntegration:
     """Integration tests for Settings class."""
