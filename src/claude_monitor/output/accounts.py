@@ -11,7 +11,13 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from claude_monitor.core.plans import get_token_limit
+from claude_monitor.data.analysis import analyze_usage
+from claude_monitor.output.api_usage import read_api_limits
+from claude_monitor.output.official import read_official_limits
+from claude_monitor.output.snapshots import build_snapshot
 
 _ACCOUNTS_ENV_VAR = "CLAUDE_MONITOR_ACCOUNTS"
 
@@ -76,3 +82,63 @@ def resolve_accounts(
             "--accounts-list."
         )
     return parse_accounts_spec(env_value)
+
+
+def _has_fresh_limit_percentage(limits: Optional[Dict[str, Any]]) -> bool:
+    """Mirrors cli.main._has_fresh_limit_percentage (kept local to avoid a
+    circular import between cli.main and this module)."""
+    if not limits or limits.get("stale"):
+        return False
+    for key in ("five_hour", "seven_day"):
+        window = limits.get(key)
+        if isinstance(window, dict) and window.get("used_percentage") is not None:
+            return True
+    return False
+
+
+def build_account_snapshot(
+    name: str, config_dir: str, args: Any, now_epoch: int
+) -> Dict[str, Any]:
+    """Build one account's snapshot, reusing the same pipeline as --once.
+
+    Mutates ``args.data_path``/``args.data_paths`` to point at this account
+    (mirroring how ``cli.main._run_once`` sets them) so ``build_snapshot``'s
+    ``source.data_paths`` reflects the right account. An explicit
+    ``--api-cache-file`` is intentionally not honored here (one override
+    can't apply to N accounts); each account always gets its own
+    auto-derived cache file.
+    """
+    projects_path = str(Path(config_dir) / "projects")
+    args.data_path = projects_path
+    args.data_paths = [projects_path]
+
+    data = analyze_usage(
+        data_path=projects_path,
+        hours_back=96 * 2,
+        use_cache=False,
+        filter_models=getattr(args, "filter_models", "all"),
+    )
+    blocks = data.get("blocks", []) or []
+
+    if getattr(args, "plan", None) == "custom" and getattr(
+        args, "custom_limit_tokens", None
+    ):
+        token_limit = int(args.custom_limit_tokens)
+    else:
+        token_limit = get_token_limit(getattr(args, "plan", "custom"), blocks)
+
+    official = read_official_limits(now_epoch=now_epoch, config_dir=config_dir)
+
+    api_limits = None
+    if getattr(args, "api", False) and not _has_fresh_limit_percentage(official):
+        api_limits = read_api_limits(
+            enabled=True,
+            now_epoch=now_epoch,
+            ttl_seconds=getattr(args, "api_ttl_seconds", 180),
+            config_dir=config_dir,
+        )
+
+    snapshot = build_snapshot(
+        data, args, token_limit, official=official, api_limits=api_limits
+    )
+    return {"name": name, "config_dir": config_dir, "snapshot": snapshot}
