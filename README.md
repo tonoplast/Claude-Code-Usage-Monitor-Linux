@@ -192,6 +192,8 @@ claude-monitor --help
 | --state-file | path | None | State file path for --write-state |
 | --statusline | flag | False | Run as a Claude Code statusline hook and capture official rate_limits |
 | --api | flag | False | Enable the opt-in experimental Anthropic OAuth usage API |
+| --accounts | flag | False | Show a per-account summary (5h/weekly % left); accounts from --accounts-list or CLAUDE_MONITOR_ACCOUNTS |
+| --accounts-list | list | [] | Explicit name=dir account pairs for --accounts (repeat or comma-separate); overrides CLAUDE_MONITOR_ACCOUNTS |
 | --data-paths | list | [] | Claude data directories to scan; repeat or comma-separate values |
 | --warehouse | flag | False | Persist usage entries to the opt-in local warehouse |
 | --warehouse-file | path | None | Usage warehouse file path |
@@ -311,6 +313,14 @@ claude-monitor --write-state --state-file ~/.claude-monitor/state/latest.json
 
 # Install as a Claude Code statusline hook to capture official rate_limits
 claude-monitor --statusline
+
+# Show 5h/weekly % left per account, one row each (never merged)
+CLAUDE_MONITOR_ACCOUNTS="work=~/.claude-work,personal=~/.claude-personal" claude-monitor --accounts
+
+# Official statusline rate_limits are now captured per account: wire the
+# hook into each account's own settings.json, keyed by its own
+# CLAUDE_CONFIG_DIR, and each gets its own capture file automatically:
+# "statusLine": {"type": "command", "command": "claude-monitor --statusline"}
 ```
 
 `--once` exits with automation-friendly codes: `0` ok, `10` near limit, `11` limit hit, `20` indeterminate/no active session, and `30` no data or config error. When official statusline data is fresh it wins; otherwise the snapshot falls back to a labeled local estimate.
