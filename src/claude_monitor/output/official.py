@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -42,9 +43,31 @@ def _finite_int(value: Any) -> Optional[int]:
 OFFICIAL_TTL_SECONDS = 600
 
 
-def default_statusline_path() -> Path:
-    """Where the ``--statusline`` writer drops the latest official capture."""
-    return Path.home() / ".claude-monitor" / "statusline" / "latest.json"
+def account_slug(config_dir: str) -> str:
+    """Sanitize a config dir path into a safe filename stem for per-account capture files."""
+    resolved = str(Path(config_dir).expanduser())
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", resolved).strip("_.")
+    return slug or "default"
+
+
+def default_statusline_path(config_dir: Optional[str] = None) -> Path:
+    """Where the ``--statusline`` writer drops the latest official capture.
+
+    When ``config_dir`` (or ``CLAUDE_CONFIG_DIR``) identifies an account, the
+    capture lives in its own file so multiple accounts never share one
+    official capture. With no account context this is unchanged: the single
+    global ``latest.json``.
+    """
+    account = (
+        config_dir if config_dir is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    )
+    base = Path.home() / ".claude-monitor" / "statusline"
+    if not account:
+        return base / "latest.json"
+    first = account.split(",", 1)[0].strip()
+    if not first:
+        return base / "latest.json"
+    return base / f"{account_slug(first)}.json"
 
 
 def _clean_pct(value: Any) -> Optional[float]:
@@ -78,14 +101,16 @@ def _window(raw: Any, now_epoch: Optional[int]) -> Optional[Dict[str, Any]]:
 
 
 def read_official_limits(
-    path: Optional[Path] = None, now_epoch: Optional[int] = None
+    path: Optional[Path] = None,
+    now_epoch: Optional[int] = None,
+    config_dir: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Read the captured official limits, or ``None`` if unavailable/unusable.
 
     Returns ``{five_hour, seven_day, captured_at_epoch, stale}`` where each window
     is ``{used_percentage, resets_at_epoch}`` or ``None`` when that window is absent.
     """
-    path = path or default_statusline_path()
+    path = path or default_statusline_path(config_dir)
     try:
         payload = json.loads(Path(path).read_text())
     except (OSError, ValueError):
@@ -116,6 +141,7 @@ def capture_statusline(
     stdin_payload: Dict[str, Any],
     path: Optional[Path] = None,
     now_epoch: Optional[int] = None,
+    config_dir: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Persist the official ``rate_limits`` from a statusline stdin payload.
 
@@ -136,7 +162,7 @@ def capture_statusline(
         "rate_limits": rate_limits if has_official else None,
     }
 
-    path = path or default_statusline_path()
+    path = path or default_statusline_path(config_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(capture))
