@@ -289,16 +289,155 @@ class TestFunctions:
             == 73.0
         )
 
-    def test_statusline_survives_garbage_stdin(self, capsys) -> None:
+    def test_statusline_survives_garbage_stdin(self, tmp_path: Path, capsys) -> None:
         """A non-JSON stdin must not crash the hook (it runs on every refresh)."""
         import importlib
         import io
 
         cli_main = importlib.import_module("claude_monitor.cli.main")
-        with patch.object(cli_main.sys, "stdin", io.StringIO("not json at all")):
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+        with (
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(cli_main.sys, "stdin", io.StringIO("not json at all")),
+        ):
             rc = cli_main.main(["--statusline"])
         assert rc == 0
         assert capsys.readouterr().out.strip() == "claude-monitor"
+
+    def test_statusline_falls_back_to_previous_capture_when_payload_is_bare(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """A refresh with no rate_limits in the payload keeps showing the last
+        known-good official numbers instead of going blank."""
+        import importlib
+        import io
+        import json
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+
+        with (
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(
+                cli_main.sys,
+                "stdin",
+                io.StringIO(
+                    json.dumps(
+                        {
+                            "model": {"display_name": "Opus 4.8"},
+                            "rate_limits": {
+                                "five_hour": {
+                                    "used_percentage": 73.0,
+                                    "resets_at": 9999999999,
+                                }
+                            },
+                        }
+                    )
+                ),
+            ),
+        ):
+            cli_main.main(["--statusline"])
+        capsys.readouterr()  # discard the first refresh's own output
+
+        # A later refresh carries no rate_limits at all (Claude Code omitted it).
+        with (
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(
+                cli_main.sys,
+                "stdin",
+                io.StringIO(json.dumps({"model": {"display_name": "Opus 4.8"}})),
+            ),
+        ):
+            rc = cli_main.main(["--statusline"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "5h 73%" in out
+
+    def test_statusline_toggle_flips_mode_and_next_refresh_reflects_it(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        import importlib
+        import io
+        import json
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        with patch.object(official.Path, "home", return_value=tmp_path):
+            rc = cli_main.main(["--statusline-toggle"])
+            assert rc == 0
+            assert "Left" in capsys.readouterr().out
+
+            state = tmp_path / ".claude-monitor" / "statusline" / "latest.json"
+            with (
+                patch.object(official, "default_statusline_path", return_value=state),
+                patch.object(
+                    cli_main.sys,
+                    "stdin",
+                    io.StringIO(
+                        json.dumps(
+                            {"rate_limits": {"five_hour": {"used_percentage": 1.0}}}
+                        )
+                    ),
+                ),
+            ):
+                cli_main.main(["--statusline"])
+
+        out = capsys.readouterr().out
+        assert "5h 99%" in out
+
+    def test_statusline_refresh_flag_uses_active_api_data_when_official_absent(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """--statusline-refresh actively refreshes via the experimental API when
+        this call's payload has no official rate_limits."""
+        import importlib
+        import io
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+
+        with (
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(cli_main.sys, "stdin", io.StringIO("{}")),
+            patch.object(
+                cli_main,
+                "read_api_limits",
+                return_value={
+                    "five_hour": {"used_percentage": 64.0, "resets_at_epoch": None},
+                    "seven_day": None,
+                    "captured_at_epoch": 1,
+                    "stale": False,
+                },
+            ) as mock_api,
+        ):
+            rc = cli_main.main(["--statusline", "--statusline-refresh", "60"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "5h 64%" in out
+        assert mock_api.call_args.kwargs["ttl_seconds"] == 60
+
+    def test_statusline_refresh_flag_clamps_below_floor(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        assert (
+            cli_main._extract_statusline_refresh_seconds(
+                ["--statusline", "--statusline-refresh", "5"]
+            )
+            == cli_main.STATUSLINE_REFRESH_MIN_SECONDS
+        )
+
+    def test_statusline_refresh_flag_absent_returns_none(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        assert cli_main._extract_statusline_refresh_seconds(["--statusline"]) is None
 
     def test_effective_token_limit_honors_explicit_custom(self) -> None:
         """An explicit --custom-limit-tokens wins over a P90/computed base (#65)."""

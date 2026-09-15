@@ -47,9 +47,12 @@ from claude_monitor.output.accounts import (
 )
 from claude_monitor.output.api_usage import read_api_limits
 from claude_monitor.output.official import (
+    STATUSLINE_MODE_USED,
     capture_statusline,
     format_statusline,
     read_official_limits,
+    read_statusline_mode,
+    toggle_statusline_mode,
 )
 from claude_monitor.output.state import default_state_path, write_state_file
 from claude_monitor.terminal.manager import (
@@ -353,13 +356,98 @@ def _run_accounts(args: argparse.Namespace) -> int:
             time.sleep(refresh_rate)
 
 
-def _run_statusline() -> int:
+STATUSLINE_REFRESH_MIN_SECONDS = 30
+
+
+def _extract_statusline_refresh_seconds(argv: List[str]) -> Optional[int]:
+    """Hand-parsed (not pydantic-settings) to keep ``--statusline``'s fast,
+    dependency-light path. Accepts ``--statusline-refresh N`` or
+    ``--statusline-refresh=N``. Values below ``STATUSLINE_REFRESH_MIN_SECONDS``
+    are clamped up to it (protects an undocumented endpoint from a typo like
+    ``--statusline-refresh 1``). Returns ``None`` when the flag is absent or
+    unparsable — the hook must never crash on a bad flag.
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--statusline-refresh" and i + 1 < len(argv):
+            raw = argv[i + 1]
+        elif arg.startswith("--statusline-refresh="):
+            raw = arg.split("=", 1)[1]
+        else:
+            continue
+        try:
+            seconds = int(raw)
+        except ValueError:
+            return None
+        return max(seconds, STATUSLINE_REFRESH_MIN_SECONDS)
+    return None
+
+
+def _resolve_statusline_limits(
+    payload: Dict[str, Any], now_epoch: int, refresh_ttl_seconds: Optional[int]
+) -> Optional[Dict[str, Any]]:
+    """Decide what official/experimental data the statusline renders.
+
+    Precedence: an active refresh (when requested and available) > this call's
+    freshly-captured official data > the last known-good official capture.
+    Returns the raw ``{"rate_limits": {...}}`` shape ``format_statusline``
+    expects. Never raises — the statusline hook must never blank on an error.
+    """
+    # Read the last known-good capture BEFORE writing this call's data — the
+    # write below overwrites the file (with a tombstone when this call has
+    # nothing new), so reading afterward would only ever see this call's own
+    # result and could never fall back to a previous refresh's good data.
+    try:
+        previous = read_official_limits(now_epoch=now_epoch)
+    except Exception:
+        previous = None
+
+    capture: Optional[Dict[str, Any]] = None
+    try:
+        capture = capture_statusline(payload, now_epoch=now_epoch)
+    except Exception as e:  # a write error must not blank the status bar
+        logging.getLogger(__name__).debug(f"statusline capture failed: {e}")
+
+    if capture is None:
+        # This refresh had nothing new; fall back to the last known-good
+        # capture instead of going blank (the persisted reader also drops a
+        # window whose reset time has already passed).
+        if previous:
+            capture = {
+                "rate_limits": {
+                    "five_hour": previous.get("five_hour"),
+                    "seven_day": previous.get("seven_day"),
+                }
+            }
+
+    if refresh_ttl_seconds is not None:
+        try:
+            api_limits = read_api_limits(enabled=True, ttl_seconds=refresh_ttl_seconds)
+        except Exception:
+            api_limits = None
+        if api_limits:
+            capture = {
+                "rate_limits": {
+                    "five_hour": api_limits.get("five_hour"),
+                    "seven_day": api_limits.get("seven_day"),
+                }
+            }
+
+    return capture
+
+
+def _run_statusline(refresh_ttl_seconds: Optional[int] = None) -> int:
     """Capture official ``rate_limits`` from Claude Code's statusline stdin and
     print the status bar line (trust keystone producer).
 
     Wire it up in Claude Code ``settings.json``::
 
         "statusLine": {"type": "command", "command": "claude-monitor --statusline"}
+
+    Add ``--statusline-refresh <seconds>`` to also actively poll the
+    experimental usage API (at most once per that interval — see
+    ``read_api_limits``'s own caching) when the passively-pushed official data
+    isn't fresh enough on its own. Toggle between used%/left% display with
+    ``claude-monitor --statusline-toggle``.
 
     Must be fast and never raise — a crash here would blank the user's status bar.
     """
@@ -371,17 +459,33 @@ def _run_statusline() -> int:
     if not isinstance(payload, dict):
         payload = {}
 
-    capture = None
+    now_epoch = int(time.time())
+    capture = _resolve_statusline_limits(payload, now_epoch, refresh_ttl_seconds)
+
+    mode = STATUSLINE_MODE_USED
     try:
-        capture = capture_statusline(payload, now_epoch=int(time.time()))
-    except Exception as e:  # a write error must not blank the status bar
-        logging.getLogger(__name__).debug(f"statusline capture failed: {e}")
+        mode = read_statusline_mode()
+    except Exception:  # a bad preference file must not blank the bar
+        pass
 
     try:
-        line = format_statusline(payload, capture)
+        line = format_statusline(payload, capture, mode=mode)
     except Exception:  # never let a formatting edge case blank the bar
         line = "claude-monitor"
     print(line)
+    return 0
+
+
+def _run_statusline_toggle() -> int:
+    """Flip the global Used/Left display mode for ``--statusline`` (see
+    ``format_statusline``). Bind a short alias to this so it's one command to
+    flip; the next statusline refresh picks it up."""
+    try:
+        mode = toggle_statusline_mode()
+    except Exception as e:
+        print(f"Failed to toggle statusline mode: {e}", file=sys.stderr)
+        return 1
+    print(f"Statusline now showing: {mode.capitalize()} %")
     return 0
 
 
@@ -397,7 +501,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # The statusline hook runs on every Claude Code refresh (sub-second), so it
     # short-circuits before the heavy settings/logging/timezone setup.
     if "--statusline" in argv:
-        return _run_statusline()
+        return _run_statusline(
+            refresh_ttl_seconds=_extract_statusline_refresh_seconds(argv)
+        )
+
+    if "--statusline-toggle" in argv:
+        return _run_statusline_toggle()
 
     once_mode = "--once" in argv
 

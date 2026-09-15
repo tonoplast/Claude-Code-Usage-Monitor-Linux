@@ -191,6 +191,8 @@ claude-monitor --help
 | --write-state | flag | False | Write the snapshot to a state file for external tools |
 | --state-file | path | None | State file path for --write-state |
 | --statusline | flag | False | Run as a Claude Code statusline hook and capture official rate_limits |
+| --statusline-refresh | seconds | None | With --statusline, actively poll the experimental usage API at most this often (min 30s) when official data isn't fresh enough on its own |
+| --statusline-toggle | flag | — | Flip the statusline between showing % used and % left; takes effect on the next statusline refresh |
 | --api | flag | False | Enable the opt-in experimental Anthropic OAuth usage API |
 | --accounts | flag | False | Show a per-account summary (5h/weekly % left); accounts from --accounts-list or CLAUDE_MONITOR_ACCOUNTS |
 | --accounts-list | list | [] | Explicit name=dir account pairs for --accounts (repeat or comma-separate); overrides CLAUDE_MONITOR_ACCOUNTS |
@@ -313,6 +315,14 @@ claude-monitor --write-state --state-file ~/.claude-monitor/state/latest.json
 
 # Install as a Claude Code statusline hook to capture official rate_limits
 claude-monitor --statusline
+
+# Actively refresh via the experimental API roughly every minute, on top of
+# whatever official data Claude Code passively pushes
+claude-monitor --statusline --statusline-refresh 60
+
+# Flip the statusline between showing % used and % left (global; affects
+# every account's statusline on its next refresh)
+claude-monitor --statusline-toggle
 
 # Show 5h/weekly % left per account, one row each (never merged)
 CLAUDE_MONITOR_ACCOUNTS="work=~/.claude-work,personal=~/.claude-personal" claude-monitor --accounts

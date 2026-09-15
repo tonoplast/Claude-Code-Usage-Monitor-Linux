@@ -170,14 +170,22 @@ def capture_statusline(
     return capture if has_official else None
 
 
+STATUSLINE_MODE_USED = "used"
+STATUSLINE_MODE_LEFT = "left"
+
+
 def format_statusline(
-    stdin_payload: Dict[str, Any], capture: Optional[Dict[str, Any]]
+    stdin_payload: Dict[str, Any],
+    capture: Optional[Dict[str, Any]],
+    mode: str = STATUSLINE_MODE_USED,
 ) -> str:
     """Render the one-line status bar shown by Claude Code's statusline.
 
     Shows the model name and the official 5h/7d usage we just captured. Leaked
     percentages (bug #52326) are skipped. Falls back to ``claude-monitor`` so the
-    bar is never blank.
+    bar is never blank. ``mode=STATUSLINE_MODE_LEFT`` shows percentage remaining
+    instead of used (clamped at 0), marked with "↓" so it's never confused with
+    the default used-percentage display.
     """
     parts = []
     model = stdin_payload.get("model") if isinstance(stdin_payload, dict) else None
@@ -195,6 +203,52 @@ def format_statusline(
                 else None
             )
             if pct is not None:
-                parts.append(f"{label} {pct:.0f}%")
+                if mode == STATUSLINE_MODE_LEFT:
+                    parts.append(f"{label} {max(0.0, 100 - pct):.0f}%↓")
+                else:
+                    parts.append(f"{label} {pct:.0f}%")
 
     return " · ".join(parts) if parts else "claude-monitor"
+
+
+def default_statusline_mode_path() -> Path:
+    """Global (not per-account) preference file for the --statusline Used/Left toggle.
+
+    This is a display preference, not account data, so it's intentionally not
+    keyed by ``config_dir`` the way the capture files are.
+    """
+    return Path.home() / ".claude-monitor" / "statusline" / "mode.json"
+
+
+def read_statusline_mode() -> str:
+    """Return the persisted display mode (``used`` or ``left``); defaults to ``used``.
+
+    Never raises — a missing or corrupt preference file must not blank the bar.
+    """
+    try:
+        payload = json.loads(default_statusline_mode_path().read_text())
+        mode = payload.get("mode") if isinstance(payload, dict) else None
+    except (OSError, ValueError):
+        mode = None
+    if mode in (STATUSLINE_MODE_USED, STATUSLINE_MODE_LEFT):
+        return mode
+    return STATUSLINE_MODE_USED
+
+
+def toggle_statusline_mode() -> str:
+    """Flip the persisted Used/Left display mode and return the new value.
+
+    Wire a short alias to this (e.g. ``claude-monitor --statusline-toggle``) so
+    it's a single command to flip; the next statusline refresh picks it up.
+    """
+    new_mode = (
+        STATUSLINE_MODE_USED
+        if read_statusline_mode() == STATUSLINE_MODE_LEFT
+        else STATUSLINE_MODE_LEFT
+    )
+    path = default_statusline_mode_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"mode": new_mode}))
+    os.replace(tmp, path)
+    return new_mode

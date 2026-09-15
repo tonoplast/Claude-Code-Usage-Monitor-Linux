@@ -9,9 +9,12 @@ from claude_monitor.output.official import (
     OFFICIAL_TTL_SECONDS,
     account_slug,
     capture_statusline,
+    default_statusline_mode_path,
     default_statusline_path,
     format_statusline,
     read_official_limits,
+    read_statusline_mode,
+    toggle_statusline_mode,
 )
 
 
@@ -329,3 +332,93 @@ def test_format_statusline_survives_nondict_shapes() -> None:
     """Valid JSON with unexpected types must not raise (the hook can't crash)."""
     line = format_statusline({"model": "Opus"}, {"rate_limits": {"five_hour": "bad"}})
     assert line == "claude-monitor"
+
+
+# --- Used/Left display toggle --------------------------------------------------
+
+
+def test_read_statusline_mode_defaults_to_used_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert read_statusline_mode() == "used"
+
+
+def test_read_statusline_mode_reads_persisted_left(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write(default_statusline_mode_path(), {"mode": "left"})
+    assert read_statusline_mode() == "left"
+
+
+def test_read_statusline_mode_tolerates_corrupt_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    p = default_statusline_mode_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json")
+    assert read_statusline_mode() == "used"
+
+
+def test_read_statusline_mode_tolerates_unknown_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write(default_statusline_mode_path(), {"mode": "sideways"})
+    assert read_statusline_mode() == "used"
+
+
+def test_toggle_statusline_mode_flips_used_to_left(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert read_statusline_mode() == "used"
+    assert toggle_statusline_mode() == "left"
+    assert read_statusline_mode() == "left"
+
+
+def test_toggle_statusline_mode_flips_left_to_used(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    toggle_statusline_mode()  # used -> left
+    assert toggle_statusline_mode() == "used"
+    assert read_statusline_mode() == "used"
+
+
+def test_toggle_statusline_mode_is_atomic_leaves_no_tmp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    toggle_statusline_mode()
+    assert list(default_statusline_mode_path().parent.glob("*.tmp")) == []
+
+
+def test_format_statusline_left_mode_shows_percentage_remaining() -> None:
+    capture = {"rate_limits": {"five_hour": {"used_percentage": 1.0}}}
+    line = format_statusline({}, capture, mode="left")
+    assert "5h 99%" in line
+
+
+def test_format_statusline_left_mode_marks_values_distinctly() -> None:
+    capture = {"rate_limits": {"five_hour": {"used_percentage": 1.0}}}
+    used_line = format_statusline({}, capture, mode="used")
+    left_line = format_statusline({}, capture, mode="left")
+    assert used_line != left_line
+    assert "↓" in left_line
+    assert "↓" not in used_line
+
+
+def test_format_statusline_left_mode_clamps_at_zero_when_used_at_limit() -> None:
+    """_clean_pct already clamps an official overshoot (e.g. 100.6) to 100.0 --
+    left-mode's own max(0, ...) must not turn that into a negative percentage."""
+    capture = {"rate_limits": {"five_hour": {"used_percentage": 100.6}}}
+    line = format_statusline({}, capture, mode="left")
+    assert "5h 0%" in line
+
+
+def test_format_statusline_used_mode_is_default() -> None:
+    capture = {"rate_limits": {"five_hour": {"used_percentage": 42.0}}}
+    assert format_statusline({}, capture) == format_statusline({}, capture, mode="used")
