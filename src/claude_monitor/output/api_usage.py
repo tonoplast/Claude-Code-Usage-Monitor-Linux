@@ -20,6 +20,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from claude_monitor.output.official import account_slug
+
 logger = logging.getLogger(__name__)
 
 API_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -28,9 +30,22 @@ API_KIND = "anthropic_oauth_usage_api"
 _BETA_HEADER = "oauth-2025-04-20"
 
 
-def default_api_cache_path() -> Path:
-    """Default cache file for experimental OAuth usage responses."""
-    return Path.home() / ".claude-monitor" / "api" / "latest.json"
+def default_api_cache_path(config_dir: Optional[str] = None) -> Path:
+    """Default cache file for experimental OAuth usage responses.
+
+    Mirrors ``official.default_statusline_path``: account-scoped when
+    ``config_dir``/``CLAUDE_CONFIG_DIR`` is set, else the single global file.
+    """
+    account = (
+        config_dir if config_dir is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    )
+    base = Path.home() / ".claude-monitor" / "api"
+    if not account:
+        return base / "latest.json"
+    first = account.split(",", 1)[0].strip()
+    if not first:
+        return base / "latest.json"
+    return base / f"{account_slug(first)}.json"
 
 
 def _finite_int(value: Any) -> Optional[int]:
@@ -179,13 +194,33 @@ def _token_from_payload(payload: Any) -> Optional[str]:
     return None
 
 
-def read_oauth_token(credentials_path: Optional[Path] = None) -> Optional[str]:
-    """Return an OAuth access token from env or Claude's credentials file."""
+def read_oauth_token(
+    credentials_path: Optional[Path] = None, config_dir: Optional[str] = None
+) -> Optional[str]:
+    """Return an OAuth access token from env or Claude's credentials file.
+
+    Precedence: ``CLAUDE_CODE_OAUTH_TOKEN`` env > explicit ``credentials_path``
+    > ``(config_dir or CLAUDE_CONFIG_DIR)/.credentials.json`` > the global
+    ``~/.claude/.credentials.json``.
+    """
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if token:
         return token
 
-    path = credentials_path or (Path.home() / ".claude" / ".credentials.json")
+    if credentials_path is not None:
+        path = credentials_path
+    else:
+        account = (
+            config_dir
+            if config_dir is not None
+            else os.environ.get("CLAUDE_CONFIG_DIR")
+        )
+        first = account.split(",", 1)[0].strip() if account else ""
+        path = (
+            Path(first).expanduser() / ".credentials.json"
+            if first
+            else Path.home() / ".claude" / ".credentials.json"
+        )
     try:
         payload = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -216,6 +251,7 @@ def read_api_limits(
     ttl_seconds: int = API_TTL_SECONDS,
     opener: Optional[Callable[..., Any]] = None,
     credentials_path: Optional[Path] = None,
+    config_dir: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Read normalized experimental OAuth usage limits.
 
@@ -226,7 +262,7 @@ def read_api_limits(
         return None
 
     now = int(time.time()) if now_epoch is None else now_epoch
-    path = cache_path or default_api_cache_path()
+    path = cache_path or default_api_cache_path(config_dir)
     cache = _read_cache(path)
 
     retry_after = _finite_int((cache or {}).get("retry_after_epoch"))
@@ -236,7 +272,7 @@ def read_api_limits(
     if _cache_is_fresh(cache, now, ttl_seconds):
         return _cached_limits(cache, now, ttl_seconds)
 
-    token = read_oauth_token(credentials_path)
+    token = read_oauth_token(credentials_path, config_dir)
     if not token:
         return _cached_limits(cache, now, ttl_seconds)
 

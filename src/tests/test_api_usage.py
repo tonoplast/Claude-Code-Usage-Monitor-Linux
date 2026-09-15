@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from claude_monitor.output.api_usage import API_TTL_SECONDS, read_api_limits
+from claude_monitor.output.api_usage import (
+    API_TTL_SECONDS,
+    default_api_cache_path,
+    read_api_limits,
+    read_oauth_token,
+)
 
 
 class _Response:
@@ -180,3 +185,93 @@ def test_retry_after_blocks_fetch_and_marks_old_cache_stale(tmp_path: Path) -> N
     assert out["stale"] is True
     assert out["five_hour"]["used_percentage"] is None
     assert out["five_hour"]["resets_at_epoch"] == 1300
+
+
+def test_default_api_cache_path_no_env_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    p = default_api_cache_path()
+    assert p.name == "latest.json"
+    assert p.parent.name == "api"
+
+
+def test_default_api_cache_path_uses_config_dir_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/tono/.claude-work")
+    p = default_api_cache_path()
+    assert p.name == "home_tono_.claude-work.json"
+
+
+def test_read_oauth_token_prefers_env_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "env-token")
+    assert read_oauth_token(config_dir=str(tmp_path)) == "env-token"
+
+
+def test_read_oauth_token_reads_config_dir_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    (tmp_path / ".credentials.json").write_text(
+        json.dumps({"accessToken": "work-token"})
+    )
+    assert read_oauth_token(config_dir=str(tmp_path)) == "work-token"
+
+
+def test_read_oauth_token_explicit_path_wins_over_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    wrong_dir = tmp_path / "wrong"
+    wrong_dir.mkdir()
+    (wrong_dir / ".credentials.json").write_text(
+        json.dumps({"accessToken": "wrong-token"})
+    )
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text(json.dumps({"accessToken": "explicit-token"}))
+
+    token = read_oauth_token(credentials_path=explicit, config_dir=str(wrong_dir))
+    assert token == "explicit-token"
+
+
+def test_read_oauth_token_falls_back_to_global_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    (fake_home / ".claude" / ".credentials.json").write_text(
+        json.dumps({"accessToken": "global-token"})
+    )
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    assert read_oauth_token() == "global-token"
+
+
+def test_read_api_limits_passes_config_dir_to_token_and_cache_path(
+    tmp_path: Path,
+) -> None:
+    """read_api_limits(config_dir=...) must reach both the cache path and the token lookup."""
+    (tmp_path / ".credentials.json").write_text(
+        json.dumps({"accessToken": "acct-token"})
+    )
+    opener = _Opener(
+        {"five_hour": {"utilization": 0.1, "resets_at": "2026-06-27T17:00:00Z"}}
+    )
+
+    out = read_api_limits(
+        enabled=True,
+        now_epoch=2000,
+        opener=opener,
+        config_dir=str(tmp_path),
+    )
+
+    assert out is not None
+    request = opener.requests[0]
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    assert headers["authorization"] == "Bearer acct-token"
+    cache_file = default_api_cache_path(config_dir=str(tmp_path))
+    assert cache_file.exists()
