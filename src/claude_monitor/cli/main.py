@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Union
 
 from rich.console import Console
+from rich.live import Live
 
 from claude_monitor import __version__
 from claude_monitor.cli.bootstrap import (
@@ -35,6 +36,14 @@ from claude_monitor.output import (
     format_json,
     format_terminal_title,
     format_text,
+)
+from claude_monitor.output.accounts import (
+    build_account_snapshot,
+    build_accounts_compact,
+    build_accounts_payload,
+    build_accounts_table,
+    resolve_accounts,
+    worst_status_code,
 )
 from claude_monitor.output.api_usage import read_api_limits
 from claude_monitor.output.official import (
@@ -284,6 +293,66 @@ def _run_once(args: argparse.Namespace) -> int:
     return snapshot["status"]["code"]
 
 
+def _run_accounts(args: argparse.Namespace) -> int:
+    """Per-account summary: one independent row per configured account (--accounts).
+
+    Never sums or merges numbers across accounts. Respects --output
+    json|text|csv the same way the single-account view does. Unlike the
+    single-account view (where --compact can also live-refresh), here
+    --compact and --once both force a single one-shot print — kept simple
+    for v1; with none of --once/--compact/a non-rich --output given, renders
+    a live-refreshing table instead.
+    """
+    try:
+        resolved = resolve_accounts(getattr(args, "accounts_list", []))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 30
+
+    output = getattr(args, "output", "rich")
+    compact = getattr(args, "compact", False)
+    once = getattr(args, "once", False)
+
+    def build_rows() -> List[Dict[str, Any]]:
+        now_epoch = int(time.time())
+        return [
+            build_account_snapshot(name, config_dir, args, now_epoch)
+            for name, config_dir in resolved.items()
+        ]
+
+    if once or output in ("json", "text", "csv") or compact:
+        if output == "csv":
+            print(
+                "CSV output is available for warehouse report views "
+                "(--view entries|sessions|burn-rate).",
+                file=sys.stderr,
+            )
+            return 30
+
+        rows = build_rows()
+        if output == "json":
+            print(format_json(build_accounts_payload(rows)))
+        elif output == "text":
+            print(format_text(build_accounts_payload(rows)))
+        elif compact:
+            print(build_accounts_compact(rows))
+        else:
+            console = get_themed_console(
+                force_theme=args.theme.lower() if getattr(args, "theme", None) else None
+            )
+            console.print(build_accounts_table(rows))
+        return worst_status_code(rows)
+
+    console = get_themed_console(
+        force_theme=args.theme.lower() if getattr(args, "theme", None) else None
+    )
+    refresh_rate = getattr(args, "refresh_rate", 10)
+    with Live(console=console, refresh_per_second=1, screen=False) as live:
+        while True:
+            live.update(build_accounts_table(build_rows()))
+            time.sleep(refresh_rate)
+
+
 def _run_statusline() -> int:
     """Capture official ``rate_limits`` from Claude Code's statusline stdin and
     print the status bar line (trust keystone producer).
@@ -354,6 +423,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if settings.view in WAREHOUSE_REPORT_VIEWS:
             return _run_warehouse_report(args)
+
+        if settings.accounts:
+            return _run_accounts(args)
 
         if settings.once:
             return _run_once(args)

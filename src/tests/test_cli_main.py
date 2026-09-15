@@ -1,5 +1,6 @@
 """Simplified tests for CLI main module."""
 
+import argparse
 import os
 import tempfile
 from pathlib import Path
@@ -60,6 +61,7 @@ class TestMain:
         mock_settings.log_level = "INFO"
         mock_settings.timezone = "UTC"
         mock_settings.once = False  # live path, not one-shot (#126)
+        mock_settings.accounts = False  # single-account live path, not --accounts
         mock_settings.to_namespace.return_value = mock_args
 
         mock_load_settings.return_value = mock_settings
@@ -329,3 +331,37 @@ class TestFunctions:
             )
             == 7000
         )
+
+    def test_main_routes_accounts_flag_to_run_accounts(self) -> None:
+        """settings.accounts routes to _run_accounts before the once/monitoring branches."""
+        import importlib
+        from unittest.mock import MagicMock
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+
+        fake_settings = MagicMock()
+        fake_settings.view = "realtime"
+        fake_settings.accounts = True
+        fake_settings.once = False
+        fake_settings.log_file = None
+        fake_settings.log_level = "INFO"
+        fake_settings.timezone = "UTC"
+        fake_settings.to_namespace.return_value = argparse.Namespace(accounts=True)
+
+        with (
+            patch(
+                "claude_monitor.core.settings.Settings.load_with_last_used",
+                return_value=fake_settings,
+            ),
+            patch.object(cli_main, "setup_environment"),
+            patch.object(cli_main, "ensure_directories"),
+            patch.object(cli_main, "setup_logging"),
+            patch.object(cli_main, "init_timezone"),
+            patch.object(
+                cli_main, "_run_accounts", return_value=0
+            ) as mock_run_accounts,
+        ):
+            rc = cli_main.main(["--accounts"])
+
+        mock_run_accounts.assert_called_once()
+        assert rc == 0
