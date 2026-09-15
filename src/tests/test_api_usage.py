@@ -252,9 +252,10 @@ def test_read_oauth_token_falls_back_to_global_default(
 
 
 def test_read_api_limits_passes_config_dir_to_token_and_cache_path(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """read_api_limits(config_dir=...) must reach both the cache path and the token lookup."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     (tmp_path / ".credentials.json").write_text(
         json.dumps({"accessToken": "acct-token"})
     )
