@@ -387,10 +387,14 @@ def _resolve_statusline_limits(
 ) -> Optional[Dict[str, Any]]:
     """Decide what official/experimental data the statusline renders.
 
-    Precedence: an active refresh (when requested and available) > this call's
-    freshly-captured official data > the last known-good official capture.
-    Returns the raw ``{"rate_limits": {...}}`` shape ``format_statusline``
-    expects. Never raises — the statusline hook must never blank on an error.
+    Precedence, per window (five_hour/seven_day independently): an active
+    refresh's value (when requested and actually usable) > this call's
+    freshly-captured official value > the last known-good official value.
+    A window the active refresh doesn't have usable data for (e.g. a stale
+    cache with no OAuth token) is left untouched rather than blanked — the
+    refresh only ever adds information, never removes it. Returns the raw
+    ``{"rate_limits": {...}}`` shape ``format_statusline`` expects. Never
+    raises — the statusline hook must never blank on an error.
     """
     # Read the last known-good capture BEFORE writing this call's data — the
     # write below overwrites the file (with a tombstone when this call has
@@ -410,7 +414,13 @@ def _resolve_statusline_limits(
     if capture is None:
         # This refresh had nothing new; fall back to the last known-good
         # capture instead of going blank (the persisted reader also drops a
-        # window whose reset time has already passed).
+        # window whose reset time has already passed). Note this only
+        # smooths a single bare refresh: capture_statusline's write above
+        # just tombstoned the shared file (intentional -- that's what lets a
+        # real plan downgrade clear stale official data for every other
+        # reader), so a second consecutive bare refresh has nothing left to
+        # fall back to here. --statusline-refresh is what survives a
+        # sustained gap, via its own independent TTL cache below.
         if previous:
             capture = {
                 "rate_limits": {
@@ -422,15 +432,20 @@ def _resolve_statusline_limits(
     if refresh_ttl_seconds is not None:
         try:
             api_limits = read_api_limits(enabled=True, ttl_seconds=refresh_ttl_seconds)
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).debug(f"statusline active refresh failed: {e}")
             api_limits = None
         if api_limits:
-            capture = {
-                "rate_limits": {
-                    "five_hour": api_limits.get("five_hour"),
-                    "seven_day": api_limits.get("seven_day"),
-                }
-            }
+            merged = dict((capture or {}).get("rate_limits") or {})
+            for key in ("five_hour", "seven_day"):
+                window = api_limits.get(key)
+                if (
+                    isinstance(window, dict)
+                    and window.get("used_percentage") is not None
+                ):
+                    merged[key] = window
+            if merged:
+                capture = {"rate_limits": merged}
 
     return capture
 

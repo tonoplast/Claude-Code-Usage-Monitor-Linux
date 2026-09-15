@@ -298,6 +298,7 @@ class TestFunctions:
         official = importlib.import_module("claude_monitor.output.official")
         state = tmp_path / "statusline" / "latest.json"
         with (
+            patch.object(official.Path, "home", return_value=tmp_path),
             patch.object(official, "default_statusline_path", return_value=state),
             patch.object(cli_main.sys, "stdin", io.StringIO("not json at all")),
         ):
@@ -319,6 +320,7 @@ class TestFunctions:
         state = tmp_path / "statusline" / "latest.json"
 
         with (
+            patch.object(official.Path, "home", return_value=tmp_path),
             patch.object(official, "default_statusline_path", return_value=state),
             patch.object(
                 cli_main.sys,
@@ -343,6 +345,7 @@ class TestFunctions:
 
         # A later refresh carries no rate_limits at all (Claude Code omitted it).
         with (
+            patch.object(official.Path, "home", return_value=tmp_path),
             patch.object(official, "default_statusline_path", return_value=state),
             patch.object(
                 cli_main.sys,
@@ -402,6 +405,7 @@ class TestFunctions:
         state = tmp_path / "statusline" / "latest.json"
 
         with (
+            patch.object(official.Path, "home", return_value=tmp_path),
             patch.object(official, "default_statusline_path", return_value=state),
             patch.object(cli_main.sys, "stdin", io.StringIO("{}")),
             patch.object(
@@ -421,6 +425,165 @@ class TestFunctions:
         assert rc == 0
         assert "5h 64%" in out
         assert mock_api.call_args.kwargs["ttl_seconds"] == 60
+
+    def test_statusline_refresh_does_not_blank_good_capture_when_api_unusable(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """read_api_limits can return a non-None dict whose windows are both
+        None (stale cache, no OAuth token) -- that must not override an
+        already-good official capture with nothing."""
+        import importlib
+        import io
+        import json
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+
+        with (
+            patch.object(official.Path, "home", return_value=tmp_path),
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(
+                cli_main.sys,
+                "stdin",
+                io.StringIO(
+                    json.dumps(
+                        {
+                            "rate_limits": {
+                                "five_hour": {
+                                    "used_percentage": 73.0,
+                                    "resets_at": 9999999999,
+                                }
+                            }
+                        }
+                    )
+                ),
+            ),
+            patch.object(
+                cli_main,
+                "read_api_limits",
+                return_value={
+                    "five_hour": {"used_percentage": None, "resets_at_epoch": None},
+                    "seven_day": None,
+                    "captured_at_epoch": 1,
+                    "stale": True,
+                },
+            ),
+        ):
+            rc = cli_main.main(["--statusline", "--statusline-refresh", "60"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "5h 73%" in out
+
+    def test_statusline_refresh_merges_api_window_alongside_good_official_window(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """A usable API window for one range fills in what official is missing,
+        without discarding official's own good window."""
+        import importlib
+        import io
+        import json
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+
+        with (
+            patch.object(official.Path, "home", return_value=tmp_path),
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(
+                cli_main.sys,
+                "stdin",
+                io.StringIO(
+                    json.dumps(
+                        {
+                            "rate_limits": {
+                                "five_hour": {
+                                    "used_percentage": 73.0,
+                                    "resets_at": 9999999999,
+                                }
+                            }
+                        }
+                    )
+                ),
+            ),
+            patch.object(
+                cli_main,
+                "read_api_limits",
+                return_value={
+                    "five_hour": None,
+                    "seven_day": {
+                        "used_percentage": 40.0,
+                        "resets_at_epoch": 9999999999,
+                    },
+                    "captured_at_epoch": 1,
+                    "stale": False,
+                },
+            ),
+        ):
+            rc = cli_main.main(["--statusline", "--statusline-refresh", "60"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "5h 73%" in out
+        assert "7d 40%" in out
+
+    def test_statusline_refresh_survives_multiple_consecutive_bare_refreshes(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """The one-cycle official-capture fallback alone can't survive a
+        sustained gap (the shared capture file gets tombstoned each bare
+        call) -- --statusline-refresh's own API cache is what makes repeated
+        bare refreshes keep showing real numbers, for as many cycles as the
+        cache stays usable."""
+        import importlib
+        import io
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+
+        api_result = {
+            "five_hour": {"used_percentage": 55.0, "resets_at_epoch": None},
+            "seven_day": None,
+            "captured_at_epoch": 1,
+            "stale": False,
+        }
+
+        for _ in range(3):
+            with (
+                patch.object(official.Path, "home", return_value=tmp_path),
+                patch.object(official, "default_statusline_path", return_value=state),
+                patch.object(cli_main.sys, "stdin", io.StringIO("{}")),
+                patch.object(cli_main, "read_api_limits", return_value=api_result),
+            ):
+                rc = cli_main.main(["--statusline", "--statusline-refresh", "60"])
+            out = capsys.readouterr().out
+            assert rc == 0
+            assert "5h 55%" in out
+
+    def test_statusline_refresh_flag_equals_form(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        assert (
+            cli_main._extract_statusline_refresh_seconds(
+                ["--statusline", "--statusline-refresh=90"]
+            )
+            == 90
+        )
+
+    def test_statusline_refresh_flag_malformed_value_disables_refresh(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        assert (
+            cli_main._extract_statusline_refresh_seconds(
+                ["--statusline", "--statusline-refresh", "soon"]
+            )
+            is None
+        )
 
     def test_statusline_refresh_flag_clamps_below_floor(self) -> None:
         import importlib
