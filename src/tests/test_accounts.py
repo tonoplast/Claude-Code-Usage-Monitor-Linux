@@ -10,8 +10,12 @@ import pytest
 from claude_monitor.output import accounts as accounts_mod
 from claude_monitor.output.accounts import (
     build_account_snapshot,
+    build_accounts_compact,
+    build_accounts_payload,
+    build_accounts_table,
     parse_accounts_spec,
     resolve_accounts,
+    worst_status_code,
 )
 
 
@@ -204,3 +208,69 @@ def test_two_accounts_stay_independent_not_merged() -> None:
         personal_row["snapshot"]["limits"]["five_hour"]["confidence"]
         == "local_estimate"
     )
+
+
+def _row(
+    name: str, five_pct: Any, seven_pct: Any = None, code: int = 0
+) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "config_dir": f"/tmp/{name}",
+        "snapshot": {
+            "plan": "pro",
+            "limits": {
+                "five_hour": {
+                    "used_percentage": five_pct,
+                    "resets_at": "2026-06-27T17:00:00+00:00",
+                    "confidence": "local_estimate",
+                },
+                "seven_day": {
+                    "used_percentage": seven_pct,
+                    "resets_at": None,
+                    "confidence": "unknown",
+                },
+            },
+            "local": {},
+            "pace": {},
+            "status": {"code": code, "label": "ok"},
+        },
+    }
+
+
+def test_build_accounts_table_has_one_row_per_account() -> None:
+    rows = [_row("work", 90.0, code=11), _row("personal", 5.0, code=0)]
+    table = build_accounts_table(rows)
+    assert table.row_count == 2
+
+
+def test_build_accounts_payload_keeps_accounts_separate() -> None:
+    rows = [_row("work", 90.0), _row("personal", 5.0)]
+    payload = build_accounts_payload(rows)
+    names = [a["name"] for a in payload["accounts"]]
+    assert names == ["work", "personal"]
+    assert (
+        payload["accounts"][0]["snapshot"]["limits"]["five_hour"]["used_percentage"]
+        == 90.0
+    )
+    assert (
+        payload["accounts"][1]["snapshot"]["limits"]["five_hour"]["used_percentage"]
+        == 5.0
+    )
+
+
+def test_build_accounts_compact_prefixes_each_line_with_account_name() -> None:
+    rows = [_row("work", 90.0), _row("personal", 5.0)]
+    out = build_accounts_compact(rows)
+    lines = out.splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("[work]")
+    assert lines[1].startswith("[personal]")
+
+
+def test_worst_status_code_takes_the_max() -> None:
+    rows = [_row("work", 90.0, code=11), _row("personal", 5.0, code=0)]
+    assert worst_status_code(rows) == 11
+
+
+def test_worst_status_code_no_rows_is_error() -> None:
+    assert worst_status_code([]) == 30
