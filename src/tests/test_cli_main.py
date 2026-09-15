@@ -276,6 +276,7 @@ class TestFunctions:
         )
 
         with (
+            patch.object(official.Path, "home", return_value=tmp_path),
             patch.object(official, "default_statusline_path", return_value=state),
             patch.object(cli_main.sys, "stdin", stdin),
         ):
