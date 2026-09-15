@@ -1,7 +1,6 @@
 """Tests for the official statusline limits reader (trust keystone)."""
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -65,16 +64,29 @@ def test_default_path_comma_separated_uses_first_dir(
     assert p.name == default_statusline_path(config_dir="/a/b").name
 
 
-def test_read_official_limits_uses_config_dir(tmp_path: Path) -> None:
+def test_read_official_limits_uses_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """When no explicit path is given, config_dir picks the right capture file."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     account_dir = str(tmp_path / "acct")
     f = default_statusline_path(config_dir=account_dir)
-    _write(f, {"captured_at_epoch": 1000, "rate_limits": {"five_hour": {"used_percentage": 5.0, "resets_at": 5000}}})
+    _write(
+        f,
+        {
+            "captured_at_epoch": 1000,
+            "rate_limits": {"five_hour": {"used_percentage": 5.0, "resets_at": 5000}},
+        },
+    )
     # A different config_dir must not see this account's capture.
-    assert read_official_limits(now_epoch=1100, config_dir=str(tmp_path / "other")) is None
+    assert (
+        read_official_limits(now_epoch=1100, config_dir=str(tmp_path / "other")) is None
+    )
 
 
-def test_capture_statusline_uses_config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_capture_statusline_uses_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     account_dir = str(tmp_path / "acct")
     capture_statusline(
