@@ -303,7 +303,21 @@ def test_capture_is_atomic_leaves_no_tmp(tmp_path: Path) -> None:
     assert list(f.parent.glob("*.tmp")) == []
 
 
-def test_format_statusline_shows_official_percentages() -> None:
+def test_format_statusline_shows_official_percentages_used_mode() -> None:
+    payload = {"model": {"display_name": "Opus 4.8"}}
+    capture = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 42.0},
+            "seven_day": {"used_percentage": 18.0},
+        }
+    }
+    line = format_statusline(payload, capture, mode="used")
+    assert "Opus 4.8" in line
+    assert "5h [42%]" in line
+    assert "7d [18%]" in line
+
+
+def test_format_statusline_shows_left_percentages_by_default() -> None:
     payload = {"model": {"display_name": "Opus 4.8"}}
     capture = {
         "rate_limits": {
@@ -313,8 +327,8 @@ def test_format_statusline_shows_official_percentages() -> None:
     }
     line = format_statusline(payload, capture)
     assert "Opus 4.8" in line
-    assert "5h 42%" in line
-    assert "7d 18%" in line
+    assert "5h [58%↓]" in line
+    assert "7d [82%↓]" in line
 
 
 def test_format_statusline_fallback_when_no_limits() -> None:
@@ -337,11 +351,11 @@ def test_format_statusline_survives_nondict_shapes() -> None:
 # --- Used/Left display toggle --------------------------------------------------
 
 
-def test_read_statusline_mode_defaults_to_used_when_missing(
+def test_read_statusline_mode_defaults_to_left_when_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    assert read_statusline_mode() == "used"
+    assert read_statusline_mode() == "left"
 
 
 def test_read_statusline_mode_reads_persisted_left(
@@ -359,7 +373,7 @@ def test_read_statusline_mode_tolerates_corrupt_file(
     p = default_statusline_mode_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{not json")
-    assert read_statusline_mode() == "used"
+    assert read_statusline_mode() == "left"
 
 
 def test_read_statusline_mode_tolerates_unknown_value(
@@ -367,15 +381,6 @@ def test_read_statusline_mode_tolerates_unknown_value(
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     _write(default_statusline_mode_path(), {"mode": "sideways"})
-    assert read_statusline_mode() == "used"
-
-
-def test_toggle_statusline_mode_flips_used_to_left(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    assert read_statusline_mode() == "used"
-    assert toggle_statusline_mode() == "left"
     assert read_statusline_mode() == "left"
 
 
@@ -383,9 +388,18 @@ def test_toggle_statusline_mode_flips_left_to_used(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    toggle_statusline_mode()  # used -> left
+    assert read_statusline_mode() == "left"
     assert toggle_statusline_mode() == "used"
     assert read_statusline_mode() == "used"
+
+
+def test_toggle_statusline_mode_flips_used_to_left(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    toggle_statusline_mode()  # left -> used
+    assert toggle_statusline_mode() == "left"
+    assert read_statusline_mode() == "left"
 
 
 def test_toggle_statusline_mode_is_atomic_leaves_no_tmp(
@@ -399,7 +413,7 @@ def test_toggle_statusline_mode_is_atomic_leaves_no_tmp(
 def test_format_statusline_left_mode_shows_percentage_remaining() -> None:
     capture = {"rate_limits": {"five_hour": {"used_percentage": 1.0}}}
     line = format_statusline({}, capture, mode="left")
-    assert "5h 99%" in line
+    assert "5h [99%↓]" in line
 
 
 def test_format_statusline_left_mode_marks_values_distinctly() -> None:
@@ -416,9 +430,89 @@ def test_format_statusline_left_mode_clamps_at_zero_when_used_at_limit() -> None
     left-mode's own max(0, ...) must not turn that into a negative percentage."""
     capture = {"rate_limits": {"five_hour": {"used_percentage": 100.6}}}
     line = format_statusline({}, capture, mode="left")
-    assert "5h 0%" in line
+    assert "5h [0%↓]" in line
 
 
-def test_format_statusline_used_mode_is_default() -> None:
+def test_format_statusline_left_mode_is_default() -> None:
     capture = {"rate_limits": {"five_hour": {"used_percentage": 42.0}}}
-    assert format_statusline({}, capture) == format_statusline({}, capture, mode="used")
+    assert format_statusline({}, capture) == format_statusline({}, capture, mode="left")
+
+
+# --- Time-until-reset ---------------------------------------------------------
+
+
+def test_format_statusline_shows_time_until_reset() -> None:
+    capture = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 30.0, "resets_at": 10000},
+        }
+    }
+    # 10000 - 7000 = 3000s = 50m
+    line = format_statusline({}, capture, now_epoch=7000)
+    assert "↺50m" in line
+
+
+def test_format_statusline_time_until_reset_hours_and_minutes() -> None:
+    capture = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 50.0, "resets_at": 10000 + 2 * 3600 + 15 * 60},
+        }
+    }
+    line = format_statusline({}, capture, now_epoch=10000)
+    assert "↺2h15m" in line
+
+
+def test_format_statusline_no_reset_when_past_epoch() -> None:
+    capture = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 50.0, "resets_at": 5000},
+        }
+    }
+    line = format_statusline({}, capture, now_epoch=6000)
+    assert "↺" not in line
+
+
+def test_format_statusline_no_reset_when_no_resets_at() -> None:
+    capture = {"rate_limits": {"five_hour": {"used_percentage": 50.0}}}
+    line = format_statusline({}, capture, now_epoch=1000)
+    assert "↺" not in line
+
+
+def test_format_statusline_time_until_reset_shows_days_for_7d_window() -> None:
+    capture = {
+        "rate_limits": {
+            "seven_day": {
+                "used_percentage": 20.0,
+                "resets_at": 10000 + 4 * 86400 + 3 * 3600,
+            },
+        }
+    }
+    line = format_statusline({}, capture, now_epoch=10000)
+    assert "↺4d3h" in line
+
+
+def test_format_statusline_reset_shown_inline_with_window_percentage() -> None:
+    """The ↺ timer for each window appears in the same segment as its percentage."""
+    capture = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 40.0, "resets_at": 10000 + 3600},
+            "seven_day": {"used_percentage": 10.0, "resets_at": 10000 + 2 * 86400},
+        }
+    }
+    line = format_statusline({}, capture, now_epoch=10000, mode="used")
+    # Each window's % and ↺ are in the same segment (no · between them).
+    assert "5h [40% ↺1h00m]" in line
+    assert "7d [10% ↺2d0h]" in line
+
+
+def test_format_statusline_reset_from_resets_at_epoch_key() -> None:
+    """Countdown works when window uses resets_at_epoch (API data) instead of resets_at."""
+    capture = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 30.0, "resets_at_epoch": 10000 + 3600},
+            "seven_day": {"used_percentage": 10.0, "resets_at_epoch": 10000 + 2 * 86400},
+        }
+    }
+    line = format_statusline({}, capture, now_epoch=10000, mode="used")
+    assert "5h [30% ↺1h00m]" in line
+    assert "7d [10% ↺2d0h]" in line

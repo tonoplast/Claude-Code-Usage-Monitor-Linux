@@ -284,7 +284,7 @@ class TestFunctions:
 
         out = capsys.readouterr().out
         assert rc == 0
-        assert "Opus 4.8" in out and "5h 73%" in out
+        assert "Opus 4.8" in out and "5h [27%↓" in out
         assert (
             json.loads(state.read_text())["rate_limits"]["five_hour"]["used_percentage"]
             == 73.0
@@ -358,7 +358,7 @@ class TestFunctions:
 
         out = capsys.readouterr().out
         assert rc == 0
-        assert "5h 73%" in out
+        assert "5h [27%↓" in out
 
     def test_statusline_toggle_flips_mode_and_next_refresh_reflects_it(
         self, tmp_path: Path, capsys
@@ -373,7 +373,8 @@ class TestFunctions:
         with patch.object(official.Path, "home", return_value=tmp_path):
             rc = cli_main.main(["--statusline-toggle"])
             assert rc == 0
-            assert "Left" in capsys.readouterr().out
+            # Default mode is left; first toggle flips it to used.
+            assert "Used" in capsys.readouterr().out
 
             state = tmp_path / ".claude-monitor" / "statusline" / "latest.json"
             with (
@@ -391,7 +392,8 @@ class TestFunctions:
                 cli_main.main(["--statusline"])
 
         out = capsys.readouterr().out
-        assert "5h 99%" in out
+        # Now in used mode: 1% used is shown directly.
+        assert "5h [1%]" in out
 
     def test_statusline_refresh_flag_uses_active_api_data_when_official_absent(
         self, tmp_path: Path, capsys
@@ -424,7 +426,7 @@ class TestFunctions:
 
         out = capsys.readouterr().out
         assert rc == 0
-        assert "5h 64%" in out
+        assert "5h [36%↓" in out
         assert mock_api.call_args.kwargs["ttl_seconds"] == 60
 
     def test_statusline_refresh_does_not_blank_good_capture_when_api_unusable(
@@ -475,7 +477,7 @@ class TestFunctions:
 
         out = capsys.readouterr().out
         assert rc == 0
-        assert "5h 73%" in out
+        assert "5h [27%↓" in out
 
     def test_statusline_refresh_merges_api_window_alongside_good_official_window(
         self, tmp_path: Path, capsys
@@ -527,8 +529,8 @@ class TestFunctions:
 
         out = capsys.readouterr().out
         assert rc == 0
-        assert "5h 73%" in out
-        assert "7d 40%" in out
+        assert "5h [27%↓" in out
+        assert "7d [60%↓" in out
 
     def test_statusline_refresh_survives_multiple_consecutive_bare_refreshes(
         self, tmp_path: Path, capsys
@@ -562,7 +564,61 @@ class TestFunctions:
                 rc = cli_main.main(["--statusline", "--statusline-refresh", "60"])
             out = capsys.readouterr().out
             assert rc == 0
-            assert "5h 55%" in out
+            assert "5h [45%↓" in out
+
+    def test_statusline_preserves_good_capture_across_many_bare_refreshes(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """Good official data persists through many consecutive bare (no rate_limits)
+        hook fires without --statusline-refresh.  The tombstone must not be written
+        when previous data is still usable (fixes the 'stuck at stale %' bug)."""
+        import importlib
+        import io
+        import json
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+        state = tmp_path / "statusline" / "latest.json"
+
+        with (
+            patch.object(official.Path, "home", return_value=tmp_path),
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(
+                cli_main.sys,
+                "stdin",
+                io.StringIO(
+                    json.dumps(
+                        {
+                            "model": {"display_name": "Opus 4.8"},
+                            "rate_limits": {
+                                "five_hour": {
+                                    "used_percentage": 41.0,
+                                    "resets_at": 9999999999,
+                                }
+                            },
+                        }
+                    )
+                ),
+            ),
+        ):
+            cli_main.main(["--statusline"])
+        capsys.readouterr()
+
+        # Three consecutive bare refreshes (no rate_limits, no --statusline-refresh).
+        for _ in range(3):
+            with (
+                patch.object(official.Path, "home", return_value=tmp_path),
+                patch.object(official, "default_statusline_path", return_value=state),
+                patch.object(
+                    cli_main.sys,
+                    "stdin",
+                    io.StringIO(json.dumps({"model": {"display_name": "Opus 4.8"}})),
+                ),
+            ):
+                rc = cli_main.main(["--statusline"])
+            out = capsys.readouterr().out
+            assert rc == 0
+            assert "5h [59%↓" in out, f"expected percentage on bare refresh, got: {out!r}"
 
     def test_statusline_refresh_flag_equals_form(self) -> None:
         import importlib
@@ -602,6 +658,237 @@ class TestFunctions:
 
         cli_main = importlib.import_module("claude_monitor.cli.main")
         assert cli_main._extract_statusline_refresh_seconds(["--statusline"]) is None
+
+    # --- daemon tests ---
+
+    def test_extract_statusline_daemon_interval_space_form(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        assert (
+            cli_main._extract_statusline_daemon_interval(
+                ["--statusline-daemon", "60"]
+            )
+            == 60
+        )
+
+    def test_extract_statusline_daemon_interval_equals_form(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        assert (
+            cli_main._extract_statusline_daemon_interval(
+                ["--statusline-daemon=45"]
+            )
+            == 45
+        )
+
+    def test_extract_statusline_daemon_interval_absent_returns_default(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        result = cli_main._extract_statusline_daemon_interval([])
+        assert result == cli_main.STATUSLINE_REFRESH_MIN_SECONDS
+
+    def test_extract_statusline_daemon_interval_clamps_below_floor(self) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        result = cli_main._extract_statusline_daemon_interval(
+            ["--statusline-daemon", "5"]
+        )
+        assert result == cli_main.STATUSLINE_REFRESH_MIN_SECONDS
+
+    def test_read_daemon_capture_returns_data_when_fresh(
+        self, tmp_path: Path
+    ) -> None:
+        """_read_daemon_capture returns the capture dict when daemon.json is fresh."""
+        import importlib
+        import json
+        import time
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        daemon_file = tmp_path / ".claude-monitor" / "statusline" / "daemon.json"
+        daemon_file.parent.mkdir(parents=True)
+        daemon_file.write_text(
+            json.dumps(
+                {
+                    "written_at": int(time.time()),
+                    "rate_limits": {
+                        "five_hour": {
+                            "used_percentage": 22.0,
+                            "resets_at_epoch": 9999999999,
+                        }
+                    },
+                }
+            )
+        )
+
+        with patch.object(official.Path, "home", return_value=tmp_path):
+            result = cli_main._read_daemon_capture(max_age_seconds=90)
+
+        assert result is not None
+        assert result["rate_limits"]["five_hour"]["used_percentage"] == 22.0
+
+    def test_read_daemon_capture_returns_none_when_stale(
+        self, tmp_path: Path
+    ) -> None:
+        """_read_daemon_capture returns None when daemon.json is older than max_age."""
+        import importlib
+        import json
+        import os
+        import time
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        daemon_file = tmp_path / ".claude-monitor" / "statusline" / "daemon.json"
+        daemon_file.parent.mkdir(parents=True)
+        daemon_file.write_text(
+            json.dumps(
+                {
+                    "written_at": int(time.time()) - 200,
+                    "rate_limits": {
+                        "five_hour": {"used_percentage": 22.0, "resets_at_epoch": 9999}
+                    },
+                }
+            )
+        )
+        # Age the file by setting its mtime to 200 seconds ago
+        old_time = time.time() - 200
+        os.utime(daemon_file, (old_time, old_time))
+
+        with patch.object(official.Path, "home", return_value=tmp_path):
+            result = cli_main._read_daemon_capture(max_age_seconds=90)
+
+        assert result is None
+
+    def test_read_daemon_capture_returns_none_when_absent(
+        self, tmp_path: Path
+    ) -> None:
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        with patch.object(official.Path, "home", return_value=tmp_path):
+            result = cli_main._read_daemon_capture(max_age_seconds=90)
+
+        assert result is None
+
+    def test_statusline_uses_daemon_cache_when_no_payload_limits(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """When no rate_limits in payload and a fresh daemon.json exists,
+        --statusline shows the daemon's cached data."""
+        import importlib
+        import io
+        import json
+        import time
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        daemon_file = tmp_path / ".claude-monitor" / "statusline" / "daemon.json"
+        daemon_file.parent.mkdir(parents=True)
+        daemon_file.write_text(
+            json.dumps(
+                {
+                    "written_at": int(time.time()),
+                    "rate_limits": {
+                        "five_hour": {
+                            "used_percentage": 30.0,
+                            "resets_at_epoch": 9999999999,
+                        }
+                    },
+                }
+            )
+        )
+
+        with (
+            patch.object(official.Path, "home", return_value=tmp_path),
+            patch.object(cli_main.sys, "stdin", io.StringIO("{}")),
+        ):
+            rc = cli_main.main(["--statusline", "--statusline-refresh", "30"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        # 30% used → 70% left
+        assert "5h [70%↓" in out
+
+    def test_statusline_bypasses_daemon_cache_when_payload_has_limits(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """When Claude Code provides live rate_limits in the payload, the daemon
+        cache is ignored and the official path is used instead."""
+        import importlib
+        import io
+        import json
+        import time
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        daemon_file = tmp_path / ".claude-monitor" / "statusline" / "daemon.json"
+        daemon_file.parent.mkdir(parents=True)
+        daemon_file.write_text(
+            json.dumps(
+                {
+                    "written_at": int(time.time()),
+                    "rate_limits": {
+                        "five_hour": {
+                            "used_percentage": 30.0,
+                            "resets_at_epoch": 9999999999,
+                        }
+                    },
+                }
+            )
+        )
+        state = tmp_path / ".claude-monitor" / "statusline" / "latest.json"
+
+        with (
+            patch.object(official.Path, "home", return_value=tmp_path),
+            patch.object(official, "default_statusline_path", return_value=state),
+            patch.object(
+                cli_main.sys,
+                "stdin",
+                io.StringIO(
+                    json.dumps(
+                        {
+                            "rate_limits": {
+                                "five_hour": {
+                                    "used_percentage": 80.0,
+                                    "resets_at": 9999999999,
+                                }
+                            }
+                        }
+                    )
+                ),
+            ),
+            patch.object(cli_main, "read_api_limits", return_value=None),
+        ):
+            rc = cli_main.main(["--statusline", "--statusline-refresh", "30"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        # Live payload 80% used → 20% left (not 70% from daemon)
+        assert "5h [20%↓" in out
+
+    def test_main_statusline_daemon_flag_returns_zero(self, tmp_path: Path) -> None:
+        """--statusline-daemon returns 0 (daemon is forked in background)."""
+        import importlib
+
+        cli_main = importlib.import_module("claude_monitor.cli.main")
+        official = importlib.import_module("claude_monitor.output.official")
+
+        with (
+            patch.object(official.Path, "home", return_value=tmp_path),
+            patch.object(cli_main.os, "fork", return_value=1),  # simulate parent
+        ):
+            rc = cli_main.main(["--statusline-daemon", "30"])
+        assert rc == 0
 
     def test_effective_token_limit_honors_explicit_custom(self) -> None:
         """An explicit --custom-limit-tokens wins over a P90/computed base (#65)."""

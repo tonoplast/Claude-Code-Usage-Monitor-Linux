@@ -48,6 +48,7 @@ from claude_monitor.output.accounts import (
 from claude_monitor.output.api_usage import read_api_limits
 from claude_monitor.output.official import (
     STATUSLINE_MODE_USED,
+    account_slug,
     capture_statusline,
     format_statusline,
     read_official_limits,
@@ -359,6 +360,93 @@ def _run_accounts(args: argparse.Namespace) -> int:
 STATUSLINE_REFRESH_MIN_SECONDS = 30
 
 
+def _statusline_daemon_path() -> Path:
+    """Account-aware path for the background daemon's cached capture JSON."""
+    env_config = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = Path.home() / ".claude-monitor" / "statusline"
+    if not env_config:
+        return base / "daemon.json"
+    first = env_config.split(",", 1)[0].strip()
+    if not first:
+        return base / "daemon.json"
+    return base / f"{account_slug(first)}_daemon.json"
+
+
+def _read_daemon_capture(max_age_seconds: int = 90) -> Optional[Dict[str, Any]]:
+    """Return the daemon's last cached capture if written within max_age_seconds, else None."""
+    try:
+        path = _statusline_daemon_path()
+        age = time.time() - path.stat().st_mtime
+        if age > max_age_seconds:
+            return None
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict) or not isinstance(data.get("rate_limits"), dict):
+            return None
+        return {"rate_limits": data["rate_limits"]}
+    except (OSError, ValueError):
+        return None
+
+
+def _run_statusline_daemon(interval_seconds: int) -> int:
+    """Fork a background daemon that writes a fresh statusline capture every interval_seconds.
+
+    Uses double-fork so the daemon survives the calling process and is adopted by init.
+    A stale daemon.json (older than 3× interval) means no daemon is running; a fresh
+    one means one is already active and we return immediately without forking again.
+    """
+    # Bail out if a daemon is already keeping things fresh
+    try:
+        path = _statusline_daemon_path()
+        if path.exists() and (time.time() - path.stat().st_mtime) < interval_seconds * 3:
+            return 0
+    except OSError:
+        pass
+
+    try:
+        first_child_pid = os.fork()
+    except OSError:
+        return 1
+    if first_child_pid > 0:
+        return 0  # Parent: daemon is running in background, return immediately
+
+    # First child: detach from terminal and fork again
+    os.setsid()
+    try:
+        second_child_pid = os.fork()
+    except OSError:
+        os._exit(1)
+    if second_child_pid > 0:
+        os._exit(0)  # First child exits; second child is adopted by init
+
+    # Daemon (second child): redirect stdio and run loop
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in range(3):
+            os.dup2(devnull, fd)
+        if devnull >= 3:
+            os.close(devnull)
+    except OSError:
+        pass
+
+    daemon_path = _statusline_daemon_path()
+    while True:
+        try:
+            now = int(time.time())
+            capture = _resolve_statusline_limits({}, now, interval_seconds)
+            if capture is not None:
+                payload = {
+                    "written_at": now,
+                    "rate_limits": (capture.get("rate_limits") or {}),
+                }
+                daemon_path.parent.mkdir(parents=True, exist_ok=True)
+                daemon_path.write_text(json.dumps(payload))
+        except Exception:
+            pass
+        time.sleep(interval_seconds)
+
+    return 0  # unreachable
+
+
 def _extract_statusline_refresh_seconds(argv: List[str]) -> Optional[int]:
     """Hand-parsed (not pydantic-settings) to keep ``--statusline``'s fast,
     dependency-light path. Accepts ``--statusline-refresh N`` or
@@ -380,6 +468,37 @@ def _extract_statusline_refresh_seconds(argv: List[str]) -> Optional[int]:
             return None
         return max(seconds, STATUSLINE_REFRESH_MIN_SECONDS)
     return None
+
+
+def _extract_statusline_daemon_interval(argv: List[str]) -> int:
+    """Parse ``--statusline-daemon [N]`` → interval in seconds (clamped to min).
+
+    Accepts ``--statusline-daemon N`` or ``--statusline-daemon=N``.
+    Falls back to ``STATUSLINE_REFRESH_MIN_SECONDS`` when N is absent or invalid.
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--statusline-daemon" and i + 1 < len(argv):
+            raw = argv[i + 1]
+        elif arg.startswith("--statusline-daemon="):
+            raw = arg.split("=", 1)[1]
+        else:
+            continue
+        try:
+            return max(int(raw), STATUSLINE_REFRESH_MIN_SECONDS)
+        except ValueError:
+            return STATUSLINE_REFRESH_MIN_SECONDS
+    return STATUSLINE_REFRESH_MIN_SECONDS
+
+
+def _previous_has_usable_data(previous: Optional[Dict[str, Any]]) -> bool:
+    """True if the previous official capture has at least one window with a percentage."""
+    if not previous:
+        return False
+    for key in ("five_hour", "seven_day"):
+        window = previous.get(key)
+        if isinstance(window, dict) and window.get("used_percentage") is not None:
+            return True
+    return False
 
 
 def _resolve_statusline_limits(
@@ -405,22 +524,25 @@ def _resolve_statusline_limits(
     except Exception:
         previous = None
 
+    payload_has_limits = isinstance(payload.get("rate_limits"), dict) and bool(
+        payload.get("rate_limits")
+    )
+
     capture: Optional[Dict[str, Any]] = None
-    try:
-        capture = capture_statusline(payload, now_epoch=now_epoch)
-    except Exception as e:  # a write error must not blank the status bar
-        logging.getLogger(__name__).debug(f"statusline capture failed: {e}")
+    if payload_has_limits or not _previous_has_usable_data(previous):
+        # Only write (possibly a tombstone) when the payload carries real data,
+        # or when there's no previous capture worth preserving. Skipping the
+        # tombstone when previous is good prevents a bare hook fire on session
+        # start from wiping a freshly-captured percentage that Claude Code just
+        # hasn't re-pushed yet. A genuine plan downgrade (free tier / older
+        # Claude Code that never sends rate_limits) still clears the file once
+        # the previous capture's windows expire naturally.
+        try:
+            capture = capture_statusline(payload, now_epoch=now_epoch)
+        except Exception as e:  # a write error must not blank the status bar
+            logging.getLogger(__name__).debug(f"statusline capture failed: {e}")
 
     if capture is None:
-        # This refresh had nothing new; fall back to the last known-good
-        # capture instead of going blank (the persisted reader also drops a
-        # window whose reset time has already passed). Note this only
-        # smooths a single bare refresh: capture_statusline's write above
-        # just tombstoned the shared file (intentional -- that's what lets a
-        # real plan downgrade clear stale official data for every other
-        # reader), so a second consecutive bare refresh has nothing left to
-        # fall back to here. --statusline-refresh is what survives a
-        # sustained gap, via its own independent TTL cache below.
         if previous:
             capture = {
                 "rate_limits": {
@@ -475,7 +597,24 @@ def _run_statusline(refresh_ttl_seconds: Optional[int] = None) -> int:
         payload = {}
 
     now_epoch = int(time.time())
-    capture = _resolve_statusline_limits(payload, now_epoch, refresh_ttl_seconds)
+
+    # When Claude Code doesn't push live rate_limits (idle between messages),
+    # use the background daemon's cached capture so the countdown stays current
+    # even when Claude Code's TUI calls us infrequently.
+    payload_has_limits = isinstance(payload.get("rate_limits"), dict) and bool(
+        payload.get("rate_limits")
+    )
+    if not payload_has_limits:
+        max_age = (refresh_ttl_seconds or STATUSLINE_REFRESH_MIN_SECONDS) * 3
+        daemon_capture = _read_daemon_capture(max_age_seconds=max_age)
+    else:
+        daemon_capture = None
+
+    capture = (
+        daemon_capture
+        if daemon_capture is not None
+        else _resolve_statusline_limits(payload, now_epoch, refresh_ttl_seconds)
+    )
 
     mode = STATUSLINE_MODE_USED
     try:
@@ -522,6 +661,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if "--statusline-toggle" in argv:
         return _run_statusline_toggle()
+
+    if any(
+        a == "--statusline-daemon" or a.startswith("--statusline-daemon=")
+        for a in argv
+    ):
+        interval = _extract_statusline_daemon_interval(argv)
+        return _run_statusline_daemon(interval)
 
     once_mode = "--once" in argv
 

@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import time as _time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -174,24 +175,47 @@ STATUSLINE_MODE_USED = "used"
 STATUSLINE_MODE_LEFT = "left"
 
 
+def _time_until_reset(epoch: Optional[int], now_epoch: int) -> Optional[str]:
+    """Return compact time string for seconds remaining until epoch."""
+    if epoch is None:
+        return None
+    secs = epoch - now_epoch
+    if secs <= 0:
+        return None
+    days, rem = divmod(secs, 86400)
+    hours, rem2 = divmod(rem, 3600)
+    mins = rem2 // 60
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{mins:02d}m"
+    if mins:
+        return f"{mins}m"
+    return "<1m"
+
+
 def format_statusline(
     stdin_payload: Dict[str, Any],
     capture: Optional[Dict[str, Any]],
-    mode: str = STATUSLINE_MODE_USED,
+    mode: str = STATUSLINE_MODE_LEFT,
+    now_epoch: Optional[int] = None,
 ) -> str:
     """Render the one-line status bar shown by Claude Code's statusline.
 
-    Shows the model name and the official 5h/7d usage we just captured. Leaked
-    percentages (bug #52326) are skipped. Falls back to ``claude-monitor`` so the
-    bar is never blank. ``mode=STATUSLINE_MODE_LEFT`` shows percentage remaining
-    instead of used (clamped at 0), marked with "↓" so it's never confused with
-    the default used-percentage display.
+    Shows the model name, the official 5h/7d usage we just captured, and the
+    time remaining until the 5h window resets. Leaked percentages (bug #52326)
+    are skipped. Falls back to ``claude-monitor`` so the bar is never blank.
+    ``mode=STATUSLINE_MODE_LEFT`` (the default) shows percentage remaining instead
+    of used (clamped at 0), marked with "↓"; ``mode=STATUSLINE_MODE_USED`` shows
+    percentage used.
     """
     parts = []
     model = stdin_payload.get("model") if isinstance(stdin_payload, dict) else None
     name = model.get("display_name") if isinstance(model, dict) else None
     if name:
         parts.append(str(name))
+
+    _now = now_epoch if now_epoch is not None else int(_time.time())
 
     rate_limits = (capture or {}).get("rate_limits")
     if isinstance(rate_limits, dict):
@@ -202,11 +226,21 @@ def format_statusline(
                 if isinstance(window, dict)
                 else None
             )
+            until = None
+            if isinstance(window, dict):
+                epoch = _finite_int(window.get("resets_at")) or _finite_int(
+                    window.get("resets_at_epoch")
+                )
+                until = _time_until_reset(epoch, _now)
             if pct is not None:
                 if mode == STATUSLINE_MODE_LEFT:
-                    parts.append(f"{label} {max(0.0, 100 - pct):.0f}%↓")
+                    pct_str = f"{max(0.0, 100 - pct):.0f}%↓"
                 else:
-                    parts.append(f"{label} {pct:.0f}%")
+                    pct_str = f"{pct:.0f}%"
+                inner = f"{pct_str} ↺{until}" if until else pct_str
+                parts.append(f"{label} [{inner}]")
+            elif until:
+                parts.append(f"↺{until}")
 
     return " · ".join(parts) if parts else "claude-monitor"
 
@@ -221,7 +255,7 @@ def default_statusline_mode_path() -> Path:
 
 
 def read_statusline_mode() -> str:
-    """Return the persisted display mode (``used`` or ``left``); defaults to ``used``.
+    """Return the persisted display mode (``used`` or ``left``); defaults to ``left``.
 
     Never raises — a missing or corrupt preference file must not blank the bar.
     """
@@ -232,7 +266,7 @@ def read_statusline_mode() -> str:
         mode = None
     if mode in (STATUSLINE_MODE_USED, STATUSLINE_MODE_LEFT):
         return mode
-    return STATUSLINE_MODE_USED
+    return STATUSLINE_MODE_LEFT
 
 
 def toggle_statusline_mode() -> str:
